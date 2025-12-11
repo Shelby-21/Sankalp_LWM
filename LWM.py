@@ -1,7 +1,8 @@
 # last_mile_interactive_sim_final.py
 # Single-file Streamlit app: improved interactive last-mile simulation
-# - Continuous playback loop (no repeated clicking required)
+# - Continuous playback loop (one-click animation)
 # - Adjustable Playback speed
+# - Layman's explanation added
 
 import streamlit as st
 import pandas as pd
@@ -20,9 +21,8 @@ SIM_START = datetime(2025, 2, 1, 8, 0)   # baseline start shown in clock
 BASE_SPEED_DEFAULT = 30.0               # km/h
 SERVICE_TIME_DEFAULT = 4                # minutes per delivery
 TIME_STEP_MIN = 1                       # simulation minute resolution (1 minute)
-ICON_URL = "https://i.imgur.com/YZ9c9xQ.png" 
 
-st.set_page_config(layout="wide", page_title="Last-mile Interactive Simulation — Final")
+st.set_page_config(layout="wide", page_title="Last-mile Interactive Simulation")
 
 # -------------------------
 # HELPERS
@@ -74,29 +74,47 @@ for c in req_cols:
         st.stop()
 
 # -------------------------
-# UI: Top description
+# UI: Title & Explanation
 # -------------------------
 st.title("🚚 Last-mile Delivery — Interactive Simulation")
 
-st.markdown("""
-**Instructions:**
-1. Adjust settings in the Sidebar (including **Playback Speed**).
-2. Click **Run Simulation** to prepare the routes.
-3. Click **▶ Start Animation** once. The simulation will run automatically to completion.
-""")
+# --- NEW: EXPLANATION SECTION ---
+with st.expander("ℹ️ How to read this simulation (Click to expand)", expanded=True):
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("""
+        **1. The Scenario**
+        We are simulating a delivery fleet in Delhi. Vehicles start at "Micro Hubs" (warehouses), visit assigned customers to drop off packages, and return to the hub.
+        
+        **2. The Visuals**
+        * 🟠 **Orange Dots:** Delivery vehicles moving in real-time.
+        * ➖ **Orange Lines:** The planned path for the day.
+        * 🗺️ **The Map:** A realistic view of the delivery zone.
+        """)
+    with col2:
+        st.markdown("""
+        **3. What affects the simulation?**
+        * **Traffic:** Vehicles move slower during peak hours (e.g., 9 AM - 11 AM) based on the "Traffic Profile" data.
+        * **Service Time:** When a vehicle reaches a customer, it stops for a few minutes (default: 4 mins) to hand over the package.
+        
+        **4. The Goal**
+        This tool visualizes fleet efficiency. Watch the **"Deliveries Completed"** counter to see how quickly the fleet serves the orders.
+        """)
+
+st.markdown("---")
 
 # -------------------------
 # SIDEBAR CONTROLS
 # -------------------------
-st.sidebar.header("Simulation Controls")
+st.sidebar.header("1. Simulation Parameters")
 vehicle_count = st.sidebar.slider("Number of vehicles", 1, max(1,len(vehicles_df)), value=min(3, len(vehicles_df)))
 base_speed = st.sidebar.slider("Base speed (km/h)", 10, 60, value=int(BASE_SPEED_DEFAULT))
 service_time = st.sidebar.slider("Service time per delivery (min)", 1, 10, value=int(SERVICE_TIME_DEFAULT))
 seed = st.sidebar.number_input("Random seed", min_value=0, value=42, step=1)
 
-# NEW: Playback Speed Control
+# Playback Speed Control
 st.sidebar.markdown("---")
-st.sidebar.header("Animation Settings")
+st.sidebar.header("2. Animation Settings")
 speed_option = st.sidebar.select_slider("Playback speed", options=["1x", "2x", "5x", "10x", "20x", "Max"], value="5x")
 
 # Convert speed option to sleep time
@@ -110,11 +128,11 @@ speed_map = {
 }
 sleep_delay = speed_map[speed_option]
 
+st.sidebar.markdown("---")
 run_sim = st.sidebar.button("Run Simulation", type="primary")
 
-st.sidebar.markdown("---")
-st.sidebar.write(f"Orders: {len(orders_df)}")
-st.sidebar.write(f"Vehicles: {len(vehicles_df)}")
+st.sidebar.write(f"Total Orders: {len(orders_df)}")
+st.sidebar.write(f"Total Vehicles Available: {len(vehicles_df)}")
 
 # -------------------------
 # ROUTING / ASSIGNMENT
@@ -204,7 +222,7 @@ if run_sim:
     vehicles_sel = vehicles_df.head(vehicle_count).copy()
     assignment = assign_round_robin(orders_df, vehicles_sel)
 
-    with st.spinner("Running math model..."):
+    with st.spinner("Calculating routes and traffic impact..."):
         pos_traces, event_log, sim_end = generate_traces(assignment, vehicles_sel, hubs_df, traffic_df, base_speed, service_time, TIME_STEP_MIN)
 
     # Store in session state
@@ -216,7 +234,7 @@ if run_sim:
     # We reset current minute to 0 on a new run
     st.session_state["current_minute"] = 0
     
-    st.success(f"Simulation ready! Total time: {sim_end} minutes. Click 'Start Animation' below.")
+    st.success(f"Simulation ready! Total shift duration: {sim_end} minutes.")
 
 # -------------------------
 # MAIN ANIMATION UI
@@ -227,8 +245,10 @@ if "pos_traces" in st.session_state:
     sim_end = st.session_state["sim_end"]
     
     # 1. Start Button
-    col_btn, col_txt = st.columns([1, 5])
+    col_btn, col_txt = st.columns([1, 4])
     start_btn = col_btn.button("▶ Start Animation")
+    if not start_btn:
+        col_txt.info("Click Start to watch the vehicles move.")
     
     # 2. Placeholders for dynamic content
     #    We create these EMPTY slots now, and update them inside the loop later.
@@ -289,9 +309,9 @@ if "pos_traces" in st.session_state:
         # C. Render KPIs
         with kpi_placeholder.container():
             c1, c2, c3 = st.columns(3)
-            c1.metric("Simulated Clock", sim_time.strftime("%Y-%m-%d %H:%M"))
-            c2.metric("Deliveries Completed", f"{count_del}")
-            c3.metric("Distance Covered", f"{dist_so_far:.2f} km")
+            c1.metric("🕒 Simulated Clock", sim_time.strftime("%Y-%m-%d %H:%M"))
+            c2.metric("📦 Deliveries Completed", f"{count_del}")
+            c3.metric("📏 Distance Covered", f"{dist_so_far:.2f} km")
 
         # D. Render Map
         scatter_layer = pdk.Layer(
@@ -319,8 +339,8 @@ if "pos_traces" in st.session_state:
 
         # E. Render Table
         with table_placeholder.container():
-            st.markdown("### Vehicle Status")
-            st.dataframe(pos_df_cur, hide_index=True)
+            st.markdown("### Vehicle Status (Live)")
+            st.dataframe(pos_df_cur, hide_index=True, use_container_width=True)
 
     # -------------------------
     # ANIMATION LOOP
@@ -331,10 +351,10 @@ if "pos_traces" in st.session_state:
             render_frame(minute)
             time.sleep(sleep_delay) # Control speed here
         
-        status_text.success("Simulation Complete!")
+        status_text.success("✅ Simulation Complete!")
     else:
-        # Show specific static frame (start or end) if not playing
+        # Show specific static frame (start) if not playing
         render_frame(0)
 
 else:
-    st.info("Please click **Run Simulation** in the sidebar to prepare the data.")
+    st.info("👈 **Step 1:** Configure parameters in the Sidebar.\n\n👇 **Step 2:** Click **Run Simulation**.")
