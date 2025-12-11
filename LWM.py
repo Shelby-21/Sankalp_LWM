@@ -1,42 +1,39 @@
 """
-last_mile_streamlit_sim.py
-Single-file Streamlit app that:
- - loads last_mile_dataset_with_coords.xlsx
- - runs a simple SimPy-based delivery simulation (straight-line travel, traffic multipliers)
- - constructs per-minute vehicle position traces (interpolated)
- - shows interactive PyDeck map with time slider to animate vehicles
- - shows KPIs and event table
+last_mile_interactive_sim.py
 
-Usage in Jupyter:
- - Run `!pip install simpy pandas streamlit pydeck numpy openpyxl` (one-time)
- - Paste this file into a cell, run it, then save as last_mile_streamlit_sim.py
- - Push to GitHub and deploy via Streamlit Cloud (or run locally with `streamlit run last_mile_streamlit_sim.py`)
+Interactive last-mile simulation + map animation (Option A: bike emoji)
+- Uses your Excel: last_mile_dataset_with_coords.xlsx
+- 1-minute resolution by default
+- Streamlit + PyDeck visualization
+- SimPy-style synchronous per-vehicle simulation (generates interpolated traces)
 """
 
-import simpy
+import streamlit as st
 import pandas as pd
 import numpy as np
 import math
 import random
 import pydeck as pdk
-import streamlit as st
+import time
 from datetime import datetime, timedelta
 
-# -------------------------
-# CONFIG / PARAMETERS
-# -------------------------
-EXCEL_PATH = "last_mile_dataset_with_coords.xlsx"  # your uploaded file name
-SIM_START = datetime(2025, 2, 1, 8, 0)   # reference start (not strictly required, used for display)
-BASE_SPEED_KMPH = 30.0      # base vehicle speed (km/h) - average across fleet for straight-line
-SERVICE_TIME_MIN = 4        # service/delivery time at customer in minutes
-TIME_STEP_MIN = 1           # resolution for animation traces (minutes)
+# -----------------------
+# CONFIGURATION / PARAMS
+# -----------------------
+EXCEL_PATH = "last_mile_dataset_with_coords.xlsx"  # ensure file in repo
+SIM_START = datetime(2025, 2, 1, 8, 0)             # displayed baseline start
+BASE_SPEED_KMPH = 30.0                             # default base speed km/h (modifiable from UI)
+SERVICE_TIME_MIN = 4                               # service time per stop in minutes
+TIME_STEP_MIN = 1                                  # animation resolution in minutes (1 recommended)
 RANDOM_SEED = 42
 random.seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
 
-# -------------------------
+st.set_page_config(layout="wide", page_title="Interactive Last-mile Sim (India)")
+
+# -----------------------
 # HELPERS
-# -------------------------
+# -----------------------
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371.0
     phi1 = math.radians(lat1)
@@ -47,334 +44,298 @@ def haversine(lat1, lon1, lat2, lon2):
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
     return R * c
 
-def find_traffic_multiplier(traffic_df, current_minute):
-    """
-    traffic_df has columns: time_slot (like "08:00-10:00") and speed_multiplier.
-    current_minute is minutes since start (we convert to HH:MM).
-    """
-    sim_time = (SIM_START + timedelta(minutes=int(current_minute))).strftime("%H:%M")
+def traffic_multiplier_for_minute(traffic_df, minute_since_start):
+    # Convert minute to HH:MM
+    tm = (SIM_START + timedelta(minutes=int(minute_since_start))).strftime("%H:%M")
     for _, r in traffic_df.iterrows():
         slot = str(r["time_slot"])
         mult = float(r["speed_multiplier"])
         try:
-            start_s, end_s = slot.split("-")
-            if start_s <= sim_time <= end_s:
-                # small random noise to avoid flatness
-                return max(0.1, mult + random.uniform(-0.03, 0.03))
+            s, e = slot.split("-")
+            if s <= tm <= e:
+                return max(0.15, mult + random.uniform(-0.03, 0.03))
         except Exception:
             continue
     return 1.0
 
-# -------------------------
+# -----------------------
 # LOAD DATA
-# -------------------------
+# -----------------------
 @st.cache_data
-def load_data(path=EXCEL_PATH):
-    x = pd.read_excel(path, sheet_name=None)
-    # expected sheets: Orders, Customers, Micro_Hubs, Lockers, Vehicles, Traffic_Profile
-    # We'll ensure column names exist
-    return x
+def load_all(path=EXCEL_PATH):
+    sheets = pd.read_excel(path, sheet_name=None)
+    return sheets
 
-data = load_data(EXCEL_PATH)
+try:
+    sheets = load_all(EXCEL_PATH)
+except Exception as e:
+    st.error(f"Failed to load {EXCEL_PATH}. Make sure the file is in repo root. Error: {e}")
+    st.stop()
 
-orders_df = data["Orders"].copy()
-customers_df = data["Customers"].copy()
-hubs_df = data["Micro_Hubs"].copy()
-vehicles_df = data["Vehicles"].copy()
-traffic_df = data["Traffic_Profile"].copy()
+orders_df = sheets["Orders"].copy()
+customers_df = sheets["Customers"].copy()
+hubs_df = sheets["Micro_Hubs"].copy()
+vehicles_df = sheets["Vehicles"].copy()
+traffic_df = sheets["Traffic_Profile"].copy()
 
-# Confirm important columns exist:
-# Orders: order_id, customer_id, order_lat, order_lon
-# Vehicles: vehicle_id, type, max_capacity_kg, start_hub
-# Hubs: hub_id, lat, lon
-# Traffic_Profile: time_slot, speed_multiplier
+# ensure correct column names exist
+required_orders_cols = ["order_id", "customer_id", "order_lat", "order_lon"]
+for c in required_orders_cols:
+    if c not in orders_df.columns:
+        st.error(f"Missing column '{c}' in Orders sheet. Found columns: {list(orders_df.columns)}")
+        st.stop()
 
-# -------------------------
-# ROUTING: simple assignment
-# -------------------------
-def assign_orders_to_vehicles(orders_df, vehicles_df):
-    """
-    Simple round-robin assignment across vehicles (keeps things deterministic & simple).
-    Returns a dict: vehicle_id -> list of order rows (as dicts).
-    """
-    vehicles = list(vehicles_df["vehicle_id"].astype(str))
-    if len(vehicles) == 0:
-        raise ValueError("No vehicles in vehicles_df")
+# -----------------------
+# UI: top description / challenge / method
+# -----------------------
+st.title("🚚 Interactive Last-mile Delivery Simulation — India (Delhi)")
+
+with st.expander("Project overview (click to expand)", expanded=True):
+    st.markdown("""
+**Challenge:** Urban last-mile delivery is expensive and inefficient due to traffic congestion, suboptimal consolidation and routing.  
+**Goal:** Build an interactive simulation + visualization to test fleet sizes, traffic scenarios and consolidation strategies, and to show stakeholder impact.
+    
+**Method chosen:** Discrete-event delivery simulation (minute-resolution) implemented in Python, with interactive visualization using Streamlit + PyDeck.  
+**Visualization style (Option A):** Bike emoji represents each vehicle; vehicles move along straight-line interpolated paths between hubs and customers.  
+    """)
+
+# -----------------------
+# Sidebar controls
+# -----------------------
+st.sidebar.header("Simulation Controls")
+vehicle_count = st.sidebar.slider("Number of vehicles to use (select first N vehicles from Vehicles sheet)", 1, max(1, len(vehicles_df)), value=min(3, max(1, len(vehicles_df))))
+base_speed_kmph = st.sidebar.slider("Base vehicle speed (km/h)", 10, 60, value=int(BASE_SPEED_KMPH))
+service_time_min = st.sidebar.slider("Service time per delivery (min)", 1, 10, value=SERVICE_TIME_MIN)
+time_step_min = st.sidebar.selectbox("Animation resolution", options=["1 minute", "10 seconds"], index=0)
+if time_step_min == "1 minute":
+    TIME_STEP = 1
+else:
+    TIME_STEP = 1/6  # 10 seconds -> 1/6 minute
+
+seed_input = st.sidebar.number_input("Random seed", min_value=0, value=RANDOM_SEED, step=1)
+
+run_button = st.sidebar.button("Run Simulation")
+
+st.sidebar.markdown("---")
+st.sidebar.write(f"Orders loaded: {len(orders_df)}")
+st.sidebar.write(f"Vehicles available: {len(vehicles_df)}")
+st.sidebar.write(f"Hubs: {len(hubs_df)}")
+
+# -----------------------
+# Assignment / routing (simple but deterministic)
+# -----------------------
+def assign_round_robin(orders_df, vehicles_selected):
+    vehicles = list(vehicles_selected[vehicles_selected.columns[0]].astype(str))
     assign = {v: [] for v in vehicles}
-    for i, (_, row) in enumerate(orders_df.iterrows()):
+    for i, (_, r) in enumerate(orders_df.iterrows()):
         v = vehicles[i % len(vehicles)]
-        assign[v].append(row.to_dict())
+        assign[v].append(r.to_dict())
     return assign
 
-# -------------------------
-# SIMPY ENV (minute resolution)
-# -------------------------
-class SimpleSimEnv:
-    def __init__(self, assignment, vehicles_df, hubs_df, traffic_df):
-        self.env = simpy.Environment()
-        self.assignment = assignment          # dict vehicle -> list(order dicts)
-        self.vehicles_df = vehicles_df
-        self.hubs_df = hubs_df
-        self.traffic_df = traffic_df
-        self.position_traces = {}             # vehicle_id -> list of dicts {minute, lat, lon, order_id, status}
-        self.event_log = []                   # event-level log
-        self.sim_duration_min = 0
+# -----------------------
+# Simulation engine (synchronous trace generation)
+# -----------------------
+def generate_traces(assignment, vehicles_df_sel, hubs_df, traffic_df, base_speed_kmph, service_time_min, time_step_min):
+    """
+    For each vehicle, generate per-minute (or per TIME_STEP) position trace and event log.
+    Returns:
+      position_traces: dict vehicle_id -> list of {minute, lat, lon, order_id, status}
+      event_log: list of {vehicle_id, order_id, arrival_minute, finish_minute, distance_km}
+      sim_duration_min: int
+    """
+    position_traces = {}
+    event_log = []
+    sim_duration_min = 0
 
-    def get_hub_coord(self, hub_id):
-        h = self.hubs_df[self.hubs_df[self.hubs_df.columns[0]] == hub_id]
-        if not h.empty:
-            return float(h.iloc[0]["lat"]), float(h.iloc[0]["lon"])
-        # fallback: first hub
-        return float(self.hubs_df.iloc[0]["lat"]), float(self.hubs_df.iloc[0]["lon"])
-
-    def run_vehicle(self, vehicle_id, orders_for_vehicle):
-        """
-        SimPy process per vehicle: depart from start_hub, visit each assigned order in sequence,
-        return to hub. We record per-minute interpolated positions.
-        """
-        # get vehicle row
-        vrow = self.vehicles_df[self.vehicles_df[self.vehicles_df.columns[0]] == vehicle_id]
+    for vid, orders in assignment.items():
+        # vehicle row
+        vrow = vehicles_df_sel[vehicles_df_sel[vehicles_df_sel.columns[0]] == vid]
         if vrow.empty:
-            vrow = self.vehicles_df.iloc[[0]]
-            hub_id = vrow.iloc[0]["start_hub"]
+            vrow = vehicles_df_sel.iloc[[0]]
+        vrow = vrow.iloc[0]
+        hub_id = vrow["start_hub"]
+        hub_row = hubs_df[hubs_df[hubs_df.columns[0]] == hub_id]
+        if hub_row.empty:
+            hub_lat = float(hubs_df.iloc[0]["lat"]); hub_lon = float(hubs_df.iloc[0]["lon"])
         else:
-            vrow = vrow.iloc[0]
-            hub_id = vrow["start_hub"]
+            hub_lat = float(hub_row.iloc[0]["lat"]); hub_lon = float(hub_row.iloc[0]["lon"])
 
-        hub_lat, hub_lon = self.get_hub_coord(hub_id)
         cur_lat, cur_lon = hub_lat, hub_lon
-        t_min = 0  # minutes since sim start for this vehicle
-
+        t_min = 0
         trace = []
-        # mark start
-        trace.append({"minute": t_min, "lat": cur_lat, "lon": cur_lon, "order_id": None, "status": "at_hub"})
+        trace.append({"minute": t_min, "lat": cur_lat, "lon": cur_lon, "order_id": "", "status": "at_hub_start"})
 
-        for order in orders_for_vehicle:
-            # destination coordinates
+        for order in orders:
             dest_lat = float(order["order_lat"])
             dest_lon = float(order["order_lon"])
             order_id = order["order_id"]
-
-            # distance km
+            # compute distance
             dist_km = haversine(cur_lat, cur_lon, dest_lat, dest_lon)
-            # get traffic multiplier based on current minute
-            mult = find_traffic_multiplier(self.traffic_df, t_min)
-            # travel time in minutes = (dist / speed_kmph) * 60 / multiplier
-            travel_minutes = (dist_km / BASE_SPEED_KMPH) * 60.0 / mult
-            # ensure at least 1 minute
-            travel_minutes = max(1.0, travel_minutes)
+            mult = traffic_multiplier_for_minute(traffic_df, t_min)
+            travel_time_min = (dist_km / base_speed_kmph) * 60.0 / mult
+            travel_time_min = max( max( (time_step_min if time_step_min>=1 else 1/6) , travel_time_min), 0.5)
 
-            # interpolate per TIME_STEP_MIN minutes
-            steps = max(1, int(math.ceil(travel_minutes / TIME_STEP_MIN)))
-            for s in range(1, steps + 1):
-                frac = s / steps
+            # number of steps
+            steps = max(1, int(math.ceil(travel_time_min / TIME_STEP)))
+            for s in range(1, steps+1):
+                frac = s/steps
                 lat = cur_lat + (dest_lat - cur_lat) * frac
                 lon = cur_lon + (dest_lon - cur_lon) * frac
-                t_min += TIME_STEP_MIN
-                trace.append({"minute": t_min, "lat": lat, "lon": lon, "order_id": order_id, "status": "enroute"})
+                t_min += TIME_STEP
+                trace.append({"minute": int(round(t_min)), "lat": lat, "lon": lon, "order_id": order_id, "status": "enroute"})
 
-            # arrive and service time
-            service_minutes = SERVICE_TIME_MIN
-            for s in range(1, int(service_minutes) + 1):
-                t_min += 1
-                trace.append({"minute": t_min, "lat": dest_lat, "lon": dest_lon, "order_id": order_id, "status": "servicing"})
+            # service time
+            service_steps = max(1, int(math.ceil(service_time_min / TIME_STEP)))
+            for s in range(service_steps):
+                t_min += TIME_STEP
+                trace.append({"minute": int(round(t_min)), "lat": dest_lat, "lon": dest_lon, "order_id": order_id, "status": "servicing"})
 
-            # event log
-            self.event_log.append({
-                "vehicle_id": vehicle_id,
-                "order_id": order_id,
-                "arrival_minute": t_min - int(service_minutes),
-                "finish_minute": t_min,
-                "distance_km": dist_km
-            })
-
-            # update current pos
+            event_log.append({"vehicle_id": vid, "order_id": order_id, "arrival_minute": int(round(t_min - service_time_min)), "finish_minute": int(round(t_min)), "distance_km": dist_km})
             cur_lat, cur_lon = dest_lat, dest_lon
 
         # return to hub
         dist_km = haversine(cur_lat, cur_lon, hub_lat, hub_lon)
-        mult = find_traffic_multiplier(self.traffic_df, t_min)
-        travel_minutes = (dist_km / BASE_SPEED_KMPH) * 60.0 / mult
-        travel_minutes = max(1.0, travel_minutes)
-        steps = max(1, int(math.ceil(travel_minutes / TIME_STEP_MIN)))
-        for s in range(1, steps + 1):
-            frac = s / steps
+        mult = traffic_multiplier_for_minute(traffic_df, t_min)
+        travel_time_min = (dist_km / base_speed_kmph) * 60.0 / mult
+        travel_time_min = max( (time_step_min if time_step_min>=1 else 1/6), travel_time_min)
+        steps = max(1, int(math.ceil(travel_time_min / TIME_STEP)))
+        for s in range(1, steps+1):
+            frac = s/steps
             lat = cur_lat + (hub_lat - cur_lat) * frac
             lon = cur_lon + (hub_lon - cur_lon) * frac
-            t_min += TIME_STEP_MIN
-            trace.append({"minute": t_min, "lat": lat, "lon": lon, "order_id": None, "status": "returning"})
+            t_min += TIME_STEP
+            trace.append({"minute": int(round(t_min)), "lat": lat, "lon": lon, "order_id": "", "status": "returning"})
 
-        # final position at hub
-        trace.append({"minute": t_min, "lat": hub_lat, "lon": hub_lon, "order_id": None, "status": "at_hub_end"})
-        self.position_traces[vehicle_id] = trace
-        # update sim duration if needed
-        if t_min > self.sim_duration_min:
-            self.sim_duration_min = int(t_min)
+        trace.append({"minute": int(round(t_min)), "lat": hub_lat, "lon": hub_lon, "order_id": "", "status": "at_hub_end"})
+        position_traces[str(vid)] = trace
+        sim_duration_min = max(sim_duration_min, int(round(t_min)))
 
-    def run(self):
-        # start processes for all vehicles
-        for vid, orders in self.assignment.items():
-            # schedule each vehicle as a process (no concurrency blocking needed here)
-            self.env.process(self.run_vehicle_proc_wrapper(vid, orders))
-        # run until all processes finish
-        self.env.run(until=1000000)  # large until - but processes manage their own time via t_min
-        # Note: Because our vehicle processes are synchronous calculations (no yields), env.run completes immediately.
-        # We do not rely on simpy's time progression for this simple implementation.
+    return position_traces, event_log, sim_duration_min
 
-    def run_vehicle_proc_wrapper(self, vid, orders):
-        # Wrapper to call the run_vehicle synchronously but still satisfy SimPy process API
-        def _proc(env):
-            self.run_vehicle(vid, orders)
-            yield env.timeout(0)
-        return _proc(self.env)
-
-# -------------------------
-# PREPARE ASSIGNMENT & RUN SIM
-# -------------------------
-st.set_page_config(layout="wide", page_title="Last-mile Sim & Map Animation")
-st.title("🚚 Last-mile Delivery — SimPy + PyDeck Map Animation")
-
-st.markdown("This app runs a simple delivery simulation and shows vehicle positions on a map. "
-            "Vehicles travel in straight lines from their start hub to assigned customers and back. "
-            "Use the slider to animate by minute.")
-
-# Controls
-vehicle_count = st.sidebar.slider("Vehicles (use 1..)", min_value=1, max_value=int(max(1, len(vehicles_df))), value=min(3, max(1, len(vehicles_df))))
-seed_input = st.sidebar.number_input("Random seed", value=RANDOM_SEED, step=1)
-run_button = st.sidebar.button("Run Simulation")
-
-# Show dataset info
-st.sidebar.write("Dataset summary:")
-st.sidebar.write(f"Orders: {len(orders_df)} | Vehicles: {len(vehicles_df)} | Hubs: {len(hubs_df)}")
-
+# -----------------------
+# Run simulation on button
+# -----------------------
 if run_button:
-    RANDOM_SEED = int(seed_input)
-    random.seed(RANDOM_SEED)
-    np.random.seed(RANDOM_SEED)
+    # set params
+    random.seed(int(seed_input)); np.random.seed(int(seed_input))
+    base_speed = float(base_speed_kmph)
+    service_time = int(service_time_min)
+    TIME_STEP = TIME_STEP  # already set
 
-    # We will select up to vehicle_count vehicles from vehicles_df
-    selected_vehicles = vehicles_df.iloc[:vehicle_count].copy()
-    # assign orders to these selected vehicles in round-robin
-    assignment = assign_orders_to_vehicles(orders_df, selected_vehicles)
+    # select first N vehicles
+    vehicles_df_sel = vehicles_df.head(vehicle_count).copy()
+    assignment = assign_round_robin(orders_df, vehicles_df_sel)
 
-    # Build simulation environment
-    sim = SimpleSimEnv(assignment, selected_vehicles, hubs_df, traffic_df)
-    # run simulation (this uses our synchronous per-vehicle routines)
-    sim.run()
+    with st.spinner("Running simulation and generating traces..."):
+        pos_traces, event_log, sim_duration_min = generate_traces(assignment, vehicles_df_sel, hubs_df, traffic_df, base_speed, service_time, TIME_STEP)
 
-    # Build position points DataFrame for animation / plotting
+    # build DataFrame of positions
     records = []
-    for vid, trace in sim.position_traces.items():
+    for vid, trace in pos_traces.items():
         for p in trace:
-            records.append({
-                "vehicle_id": str(vid),
-                "minute": int(p["minute"]),
-                "lat": float(p["lat"]),
-                "lon": float(p["lon"]),
-                "order_id": p["order_id"] if p["order_id"] is not None else "",
-                "status": p["status"]
-            })
+            records.append({"vehicle_id": vid, "minute": p["minute"], "lat": p["lat"], "lon": p["lon"], "order_id": p["order_id"], "status": p["status"]})
     pos_df = pd.DataFrame.from_records(records)
-    if pos_df.empty:
-        st.error("No position data generated.")
-    else:
-        max_minute = int(pos_df["minute"].max())
-        st.sidebar.write(f"Simulation duration (minutes): {max_minute}")
 
-        # KPI panel
-        total_distance = sum([e["distance_km"] for e in sim.event_log])
-        total_deliveries = len(sim.event_log)
-        avg_time_per_delivery = None
-        if total_deliveries > 0:
-            avg_time_per_delivery = np.mean([e["finish_minute"] - e["arrival_minute"] for e in sim.event_log])
+    # KPIs
+    total_deliveries = len(event_log)
+    total_distance = sum([e["distance_km"] for e in event_log])
+    avg_service = np.mean([e["finish_minute"]-e["arrival_minute"] for e in event_log]) if total_deliveries>0 else None
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total Deliveries (simulated)", total_deliveries)
-        col2.metric("Total Distance (approx km)", f"{total_distance:.2f}")
-        col3.metric("Avg service time (min)", f"{avg_time_per_delivery:.1f}" if avg_time_per_delivery else "N/A")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total Deliveries (simulated)", total_deliveries)
+    col2.metric("Total Distance (approx km)", f"{total_distance:.2f}")
+    col3.metric("Avg service duration (min)", f"{avg_service:.1f}" if avg_service else "N/A")
 
-        # Time slider for animation
-        t = st.slider("Animation time (minute)", min_value=0, max_value=max_minute, value=0, step=1)
+    # Time slider + Play
+    t_min = st.slider("Animation time (minute)", min_value=0, max_value=sim_duration_min, value=0, step=1)
+    play = st.button("Play animation")
 
-        # For the selected time t, pick latest position per vehicle at or before t
-        df_t = pos_df[pos_df["minute"] <= t].sort_values(["vehicle_id", "minute"]).groupby("vehicle_id").tail(1)
+    # handle play via session state loop (basic)
+    if "play" not in st.session_state:
+        st.session_state.play = False
+    if play:
+        st.session_state.play = True
+    if st.sidebar.button("Pause"):
+        st.session_state.play = False
 
-        # Map: lines = route polylines per vehicle; points = vehicle current positions
-        # Prepare route lines (full route)
-        route_lines = []
-        for vid, trace in sim.position_traces.items():
-            coords = [[p["lon"], p["lat"]] for p in trace]
-            route_lines.append({"vehicle_id": str(vid), "path": coords})
+    # Autoplay loop (will rerun page while playing)
+    if st.session_state.play:
+        for tt in range(t_min, sim_duration_min+1):
+            t_min = tt
+            time.sleep(0.08)  # short sleep to animate (0.08s per frame)
+            st.session_state.current_time = t_min
+            st.experimental_rerun()  # rerun script to update slider & map
 
-        # PyDeck layers
-        # 1) route lines (solid)
-        route_layer = pdk.Layer(
-            "ArcLayer",
-            data=route_lines,
-            get_source_position="path[0]",
-            get_target_position="path[-1]",
-            get_width=3,
-            get_tilt=15,
-            pickable=True,
-            auto_highlight=True,
-            get_source_color=[0, 128, 200],
-            get_target_color=[200, 30, 0],
+    # use slider value or session_state
+    if "current_time" in st.session_state:
+        t_min = st.session_state.current_time if st.session_state.current_time <= sim_duration_min else t_min
+
+    # build df for map at time t_min
+    df_t = pos_df[pos_df["minute"] <= t_min].sort_values(["vehicle_id", "minute"]).groupby("vehicle_id").tail(1).reset_index(drop=True)
+
+    # Build route lines for visualization (full path per vehicle)
+    route_lines = []
+    for vid, trace in pos_traces.items():
+        coords = [[p["lon"], p["lat"]] for p in trace]
+        route_lines.append({"vehicle_id": vid, "path": coords})
+
+    # PyDeck layers
+    # 1) PathLayer for route polylines
+    path_layer = pdk.Layer(
+        "PathLayer",
+        data=route_lines,
+        get_path="path",
+        get_width=4,
+        pickable=True,
+        width_min_pixels=2,
+    )
+
+    # 2) TextLayer for bike emoji at vehicle positions
+    if not df_t.empty:
+        df_t["text"] = "🏍️"
+        text_layer = pdk.Layer(
+            "TextLayer",
+            data=df_t,
+            get_position=["lon", "lat"],
+            get_text="text",
+            get_size=32,
+            get_angle=0,
+            get_text_anchor="'middle'",
+            get_alignment_baseline="'center'",
         )
+    else:
+        text_layer = None
 
-        # 2) vehicle points (current)
-        points_df = df_t.copy()
-        if points_df.empty:
-            # fallback: show hubs
-            hubs_points = hubs_df.rename(columns={hubs_df.columns[1]: "lat", hubs_df.columns[2]: "lon"})
-            points_layer = pdk.Layer(
-                "ScatterplotLayer",
-                data=hubs_points,
-                get_position=["lon", "lat"],
-                get_radius=80,
-                get_fill_color=[0, 200, 0],
-                pickable=True
-            )
-            initial_view = pdk.ViewState(latitude=hubs_points.iloc[0]["lat"], longitude=hubs_points.iloc[0]["lon"], zoom=12)
-            deck = pdk.Deck(layers=[points_layer, route_layer], initial_view_state=initial_view)
-            st.pydeck_chart(deck)
-        else:
-            points_layer = pdk.Layer(
-                "ScatterplotLayer",
-                data=points_df,
-                get_position=["lon", "lat"],
-                get_fill_color=[255, 140, 0],
-                get_radius=80,
-                pickable=True
-            )
-            # create a center for initial view: mean of points
-            center_lat = float(points_df["lat"].mean())
-            center_lon = float(points_df["lon"].mean())
-            initial_view = pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=12)
-            deck = pdk.Deck(layers=[route_layer, points_layer], initial_view_state=initial_view)
-            st.pydeck_chart(deck)
+    # initial view centered on mean position within India (Delhi area)
+    if not pos_df.empty:
+        lat0 = float(pos_df["lat"].mean())
+        lon0 = float(pos_df["lon"].mean())
+    else:
+        lat0 = 28.6139; lon0 = 77.2090  # Delhi fallback
 
-        # show event log and pos_df slices
-        st.write("### Event Log (sample)")
-        st.dataframe(pd.DataFrame(sim.event_log).head(50))
+    view = pdk.ViewState(latitude=lat0, longitude=lon0, zoom=12, pitch=0)
 
-        st.write("### Vehicle Positions (sample)")
-        st.dataframe(pos_df.sort_values(["vehicle_id", "minute"]).head(200))
+    layers = [path_layer]
+    if text_layer is not None:
+        layers.append(text_layer)
 
-        # Optionally allow CSV export
-        csv_positions = pos_df.to_csv(index=False).encode("utf-8")
-        st.download_button("Download position traces CSV", data=csv_positions, file_name="position_traces.csv", mime="text/csv")
-        csv_events = pd.DataFrame(sim.event_log).to_csv(index=False).encode("utf-8")
-        st.download_button("Download event log CSV", data=csv_events, file_name="event_log.csv", mime="text/csv")
+    deck = pdk.Deck(layers=layers, initial_view_state=view, tooltip={"text": "Vehicle: {vehicle_id}"})
+    st.pydeck_chart(deck)
+
+    # Display event log and positions
+    st.write("### Event log (sample)")
+    st.dataframe(pd.DataFrame(event_log).head(50))
+
+    st.write("### Position traces (sample)")
+    st.dataframe(pos_df.sort_values(["vehicle_id", "minute"]).head(200))
+
+    # Downloads
+    st.download_button("Download event log CSV", data=pd.DataFrame(event_log).to_csv(index=False).encode("utf-8"), file_name="event_log.csv")
+    st.download_button("Download position traces CSV", data=pos_df.to_csv(index=False).encode("utf-8"), file_name="position_traces.csv")
 
 else:
-    st.info("Adjust controls in the sidebar and click 'Run Simulation' to start.")
-    st.write("You can also preview some data.")
-
-    st.write("Orders (first 5 rows):")
+    st.info("Configure parameters in the sidebar and click 'Run Simulation' to start.")
+    st.write("Orders preview:")
     st.dataframe(orders_df.head())
-
-    st.write("Vehicles (all):")
-    st.dataframe(vehicles_df)
-
-    st.write("Micro hubs (all):")
-    st.dataframe(hubs_df)
+    st.write("Vehicles preview:")
+    st.dataframe(vehicles_df.head())
